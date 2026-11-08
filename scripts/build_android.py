@@ -216,6 +216,39 @@ def package(ndk, sdk, variant, use_daemon=False):
     return result
 
 
+def _check_build_tools(parser, args, ndk):
+    """Fail fast when a tool the build invokes is missing from PATH.
+
+    Runs before the ROM staging / dependency fetching work, so a missing
+    tool is a seconds-long clear error instead of a traceback minutes
+    into the build (what Ray hit with cmake at the host-tools configure).
+    Scoped to the stages that actually need each tool: this is only
+    reached on non---package-only runs (package-only runs Gradle only),
+    and gcc/g++ are only needed by the host-tools configure on Windows.
+    """
+    if shutil.which(args.cmake) is None:
+        parser.error(
+            "CMake is not on PATH. Install it from https://cmake.org/download/ "
+            "(tick \"Add CMake to the system PATH\" in the Windows installer), "
+            "or pass --cmake with the full path to cmake.exe.")
+    if shutil.which("ninja") is None:
+        host = "windows-x86_64" if os.name == "nt" else "linux-x86_64"
+        suffix = ".exe" if os.name == "nt" else ""
+        bundle = "ninja-win.zip" if os.name == "nt" else "ninja-linux.zip"
+        parser.error(
+            "Ninja is not on PATH (this script uses the Ninja generator). "
+            f"The Android NDK already ships one at {ndk}/prebuilt/{host}/bin/ninja{suffix} "
+            f"(add that directory to PATH), or download {bundle} from "
+            "https://github.com/ninja-build/ninja/releases.")
+    if os.name == "nt" and not args.skip_host_tools:
+        missing = [compiler for compiler in ("gcc", "g++") if shutil.which(compiler) is None]
+        if missing:
+            parser.error(
+                "MinGW " + " and ".join(missing) + " not found on PATH. "
+                "The host-tools step needs a C/C++ compiler (MSYS2 mingw-w64, "
+                "or a standalone mingw-w64 — add its bin directory to PATH).")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--release", action="store_true", help="Require release signing environment variables")
@@ -258,6 +291,11 @@ def main():
             package(ndk, sdk, "release" if args.release else "debug", args.gradle_daemon)
         _print_timings(timings)
         return
+
+    # Prerequisite tools (cmake/ninja/gcc): fail fast here, before any
+    # slow work, instead of dying with a traceback mid-build. Scoped
+    # inside _check_build_tools: --package-only never reaches this point.
+    _check_build_tools(parser, args, ndk)
 
     # --- Stage the ROM (build machine only, never committed). ---
     # Timed as part of codegen below (the staged ROM is a codegen input).
