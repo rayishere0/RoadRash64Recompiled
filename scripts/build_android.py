@@ -22,14 +22,22 @@ with --rom (a .z64, or a .zip containing one). tools/stage_rom.py verifies
 it (32 MiB, SHA-1 87727a298f583ec8325f5655088ff21e37b335b2) and writes the
 normalised ROM to build/roadrash64.us.z64 (gitignored).
 
+Incremental rebuilds: after a first full build, re-run with --fast
+(--skip-deps --skip-host-tools --skip-codegen). See
+docs/ANDROID_GAME_BUILD.md ("Incremental rebuilds"). A run with no new
+flags is a full build, exactly as before.
+
 NOT compile-checked: no NDK / Android Studio / ROM on this machine.
 """
 import argparse
+import contextlib
+import hashlib
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 import zipfile
 
 from dependency_patches import apply_platform_patches
@@ -60,6 +68,77 @@ def fetch_repo(url, destination, commit):
         raise RuntimeError(f"Unexpected revision in {destination}: {actual} (want {commit})")
 
 
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _codegen_stamp(host, suffix):
+    """Hash of everything the recompile step reads.
+
+    The stamp lives in build/ (gitignored). If it matches, the generated
+    C is already up to date and the translators need not run again:
+    re-running them would rewrite build/RecompiledFuncs and force the
+    whole game to recompile even though nothing changed. A hash, not
+    timestamps: a fresh checkout changes every mtime, so timestamps
+    would never let a rebuild skip.
+    """
+    staged_rom = ROOT / "build/roadrash64.us.z64"
+    inputs = [
+        staged_rom,
+        ROOT / "config/roadrash64.us.toml",
+        ROOT / "config/roadrash64.us.audio_rsp.toml",
+        host / "bin" / f"N64Recomp{suffix}",
+        host / "bin" / f"RSPRecomp{suffix}",
+    ]
+    digest = hashlib.sha256()
+    for path in inputs:
+        digest.update(str(path).encode())
+        digest.update(b"\0")
+        digest.update(_file_sha256(path).encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _codegen_is_current(host, suffix):
+    # A stamp from a build whose generated output has since been deleted
+    # (build/ wiped, fresh checkout) must not count as up to date.
+    if not (ROOT / "build/RecompiledFuncs").is_dir():
+        return False
+    stamp = ROOT / "build/.codegen-stamp"
+    if not stamp.is_file():
+        return False
+    try:
+        return stamp.read_text(encoding="utf-8").strip() == _codegen_stamp(host, suffix)
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def _codegen_mark_current(host, suffix):
+    stamp = ROOT / "build/.codegen-stamp"
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(_codegen_stamp(host, suffix) + "\n", encoding="utf-8")
+
+
+@contextlib.contextmanager
+def _timed(timings, name, skipped=False, extra=0.0):
+    start = time.monotonic()
+    try:
+        yield
+    finally:
+        timings.append((name, time.monotonic() - start + extra, skipped))
+
+
+def _print_timings(timings):
+    print("Build timings (seconds):")
+    for name, seconds, skipped in timings:
+        print(f"  {name}: {seconds:.1f}{' (skipped)' if skipped else ''}")
+    print(f"  total: {sum(seconds for _, seconds, _ in timings):.1f}")
+
+
 def prepare_sources():
     # RR64's own pinned deps + patches + overrides (no ROM involved).
     run(sys.executable, "-B", ROOT / "scripts/setup_dependencies.py")
@@ -73,7 +152,7 @@ def prepare_sources():
     apply_platform_patches(ROOT, "android")
 
 
-def package(ndk, sdk, variant):
+def package(ndk, sdk, variant, use_daemon=False):
     """Package the native build into the :app APK (adapted from AeroGauge).
 
     Libraries are the v1 set only: libmain.so (game), libSDL2.so,
@@ -118,7 +197,8 @@ def package(ndk, sdk, variant):
     os.environ["ANDROID_HOME"] = str(sdk)
     wrapper = ROOT / "android" / ("gradlew.bat" if os.name == "nt" else "gradlew")
     command = [wrapper] if os.name == "nt" else ["sh", wrapper]
-    run(*command, "--no-daemon", ":app:assemble" + variant.capitalize(), cwd=ROOT / "android")
+    gradle_args = [] if use_daemon else ["--no-daemon"]
+    run(*command, *gradle_args, ":app:assemble" + variant.capitalize(), cwd=ROOT / "android")
     apk = ROOT / f"android/app/build/outputs/apk/{variant}/app-{variant}.apk"
     with zipfile.ZipFile(apk) as archive:
         for name in archive.namelist():
@@ -140,12 +220,24 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--release", action="store_true", help="Require release signing environment variables")
     parser.add_argument("--package-only", action="store_true", help="Package an existing native build without rebuilding")
+    parser.add_argument("--native-only", action="store_true", help="Stop after the native CMake build; skip package(). Mirror of --package-only.")
+    parser.add_argument("--skip-deps", action="store_true", help="Skip prepare_sources() (pinned deps + Android deps + patches). Only safe when the pinned dependencies are already present at the right revisions — use after a full build, not after a clean checkout.")
+    parser.add_argument("--skip-host-tools", action="store_true", help="Skip the host-tools configure+build when N64Recomp, RSPRecomp and file_to_c already exist in build-android/host/bin.")
+    parser.add_argument("--skip-codegen", action="store_true", help="Skip the N64Recomp/RSPRecomp runs when the generated code is up to date (hash stamp over the staged ROM, the .toml configs and the translator binaries). Regenerates automatically when any input changes.")
+    parser.add_argument("--fast", action="store_true", help="Shorthand for --skip-deps --skip-host-tools --skip-codegen: the normal re-run after a successful full build.")
+    parser.add_argument("--gradle-daemon", action="store_true", help="Use the Gradle daemon for :app:assemble (drop --no-daemon). Default stays --no-daemon so CI behaviour is unchanged.")
     parser.add_argument("--install", action="store_true", help="Install the finished APK on the connected device")
     parser.add_argument("--rom", default=None, help="Path to your Road Rash 64 (USA) ROM (.z64, or a .zip containing one)")
     parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 4, 12))
     parser.add_argument("--sdk", default=os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT"))
     parser.add_argument("--cmake", default="cmake")
     args = parser.parse_args()
+    if args.fast:
+        args.skip_deps = args.skip_host_tools = args.skip_codegen = True
+    if args.package_only and args.native_only:
+        parser.error("--package-only and --native-only cannot be combined")
+    if args.native_only and args.install:
+        parser.error("--install needs the packaged APK; it cannot be combined with --native-only")
     if not args.sdk:
         parser.error("Set ANDROID_HOME or pass --sdk")
     if args.jobs < 1:
@@ -160,11 +252,16 @@ def main():
         parser.error(f"Install Android NDK {NDK_VERSION} with sdkmanager")
     WORK.mkdir(exist_ok=True)
 
+    timings = []
     if args.package_only:
-        package(ndk, sdk, "release" if args.release else "debug")
+        with _timed(timings, "package"):
+            package(ndk, sdk, "release" if args.release else "debug", args.gradle_daemon)
+        _print_timings(timings)
         return
 
     # --- Stage the ROM (build machine only, never committed). ---
+    # Timed as part of codegen below (the staged ROM is a codegen input).
+    stage_start = time.monotonic()
     staged_rom = ROOT / "build/roadrash64.us.z64"
     if args.rom:
         run(sys.executable, "-B", ROOT / "tools/stage_rom.py", args.rom)
@@ -172,22 +269,46 @@ def main():
         parser.error("Place your Road Rash 64 (USA) ROM with --rom, or stage it first:\n"
                      "  python3 tools/stage_rom.py \"/path/to/Road Rash 64 (USA).z64\"\n"
                      "The ROM is required on the build machine only and is never committed.")
+    stage_seconds = time.monotonic() - stage_start
 
-    prepare_sources()
+    with _timed(timings, "deps", args.skip_deps):
+        if not args.skip_deps:
+            prepare_sources()
 
     # --- Host tools (x86_64): translators + shader embedder. ---
     host = WORK / "host"
-    host_flags = []
-    if os.name == "nt":
-        host_flags = ["-DCMAKE_C_COMPILER=gcc.exe", "-DCMAKE_CXX_COMPILER=g++.exe"]
-    run(args.cmake, "-S", ROOT / "android/host-tools", "-B", host, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", *host_flags)
-    run(args.cmake, "--build", host, "--target", "N64RecompCLI", "RSPRecomp", "file_to_c", "-j", args.jobs)
     suffix = ".exe" if os.name == "nt" else ""
+    with _timed(timings, "host tools", args.skip_host_tools):
+        if args.skip_host_tools:
+            missing = [name for name in ("N64Recomp", "RSPRecomp", "file_to_c")
+                       if not (host / "bin" / f"{name}{suffix}").is_file()]
+            if missing:
+                raise RuntimeError(
+                    "Host tools missing from build-android/host/bin: "
+                    + ", ".join(missing)
+                    + ". Run a full build (without --skip-host-tools) first.")
+        else:
+            host_flags = []
+            if os.name == "nt":
+                host_flags = ["-DCMAKE_C_COMPILER=gcc.exe", "-DCMAKE_CXX_COMPILER=g++.exe"]
+            run(args.cmake, "-S", ROOT / "android/host-tools", "-B", host, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", *host_flags)
+            run(args.cmake, "--build", host, "--target", "N64RecompCLI", "RSPRecomp", "file_to_c", "-j", args.jobs)
 
     # --- Recompilation (BUILD TIME, not on the phone). ---
-    run(host / "bin" / f"N64Recomp{suffix}", "config/roadrash64.us.toml")
-    run(host / "bin" / f"RSPRecomp{suffix}", "config/roadrash64.us.audio_rsp.toml")
-    print(f"RecompiledFuncs generated under {ROOT / 'build/RecompiledFuncs'}")
+    # --skip-codegen is a conditional skip, not a force skip: if any input
+    # changed (ROM, .toml configs, translator binaries) the stamp no longer
+    # matches and codegen runs again. The stamp is refreshed after every
+    # codegen run, flag or not, so a later --fast run can skip.
+    with _timed(timings, "codegen", args.skip_codegen, stage_seconds):
+        if args.skip_codegen and _codegen_is_current(host, suffix):
+            print("Codegen outputs up to date (stamp matches); skipping N64Recomp/RSPRecomp.")
+        else:
+            if args.skip_codegen:
+                print("Codegen outputs not up to date; regenerating.")
+            run(host / "bin" / f"N64Recomp{suffix}", "config/roadrash64.us.toml")
+            run(host / "bin" / f"RSPRecomp{suffix}", "config/roadrash64.us.audio_rsp.toml")
+            print(f"RecompiledFuncs generated under {ROOT / 'build/RecompiledFuncs'}")
+            _codegen_mark_current(host, suffix)
 
     # --- NDK cross-compile: the native game target (libmain.so). ---
     # Configure native/ (not the repo root): its CMakeLists includes
@@ -204,15 +325,21 @@ def main():
         _launcher = os.environ.get(_var)
         if _launcher:
             ccache_flags.append(f"-D{_var}={_launcher}")
-    run(args.cmake, "-S", ROOT / "native", "-B", WORK / "native", "-G", "Ninja",
-        f"-DCMAKE_TOOLCHAIN_FILE={ndk.as_posix()}/build/cmake/android.toolchain.cmake",
-        "-DANDROID_ABI=arm64-v8a", "-DANDROID_PLATFORM=android-28", "-DANDROID_STL=c++_shared",
-        "-DCMAKE_BUILD_TYPE=Release",
-        f"-DRR64_HOST_TOOLS={WORK.as_posix()}/host/bin",
-        "-DRR64_BUILD_TESTS=OFF", "-DRR64_EXPERIMENTAL_COURSE=OFF",
-        *ccache_flags)
-    run(args.cmake, "--build", WORK / "native", "--target", "RoadRash64Recompiled", "-j", args.jobs)
-    apk = package(ndk, sdk, "release" if args.release else "debug")
+    with _timed(timings, "native"):
+        run(args.cmake, "-S", ROOT / "native", "-B", WORK / "native", "-G", "Ninja",
+            f"-DCMAKE_TOOLCHAIN_FILE={ndk.as_posix()}/build/cmake/android.toolchain.cmake",
+            "-DANDROID_ABI=arm64-v8a", "-DANDROID_PLATFORM=android-28", "-DANDROID_STL=c++_shared",
+            "-DCMAKE_BUILD_TYPE=Release",
+            f"-DRR64_HOST_TOOLS={WORK.as_posix()}/host/bin",
+            "-DRR64_BUILD_TESTS=OFF", "-DRR64_EXPERIMENTAL_COURSE=OFF",
+            *ccache_flags)
+        run(args.cmake, "--build", WORK / "native", "--target", "RoadRash64Recompiled", "-j", args.jobs)
+    if args.native_only:
+        _print_timings(timings)
+        print("Native build done (--native-only); libmain.so is under build-android/native.")
+        return
+    with _timed(timings, "package"):
+        apk = package(ndk, sdk, "release" if args.release else "debug", args.gradle_daemon)
     if args.install:
         if shutil.which("adb") is None:
             parser.error("--install needs adb on PATH (Android SDK platform-tools)")
@@ -220,6 +347,7 @@ def main():
     print(f"APK: {apk}")
     print("Next: stage the ROM on the device (see docs/ANDROID_GAME_BUILD.md),")
     print("then launch the app — it auto-starts to the title screen.")
+    _print_timings(timings)
 
 
 if __name__ == "__main__":
