@@ -10,7 +10,9 @@
 //                                         detectDataPath=false })
 //   -> app->setup(thread_id 0)
 //   -> app->updateScreen()  (submits one present of the stub VI framebuffer)
-//   -> presentQueue->waitForPresentId(state->presentId)
+//   -> bounded poll of presentQueue->presentId (10 s deadline, never an
+//      unbounded waitForPresentId: a stuck present thread must report
+//      TIMEOUT, not freeze silently — see 0.1.1 notes in docs/ANDROID_PROBE.md)
 //   -> resize the SDL window, updateScreen() again (exercises the
 //      swapchain-recreate path RT64's present queue owns)
 //
@@ -32,11 +34,13 @@
 // android/probe/README.md.
 #include <android/log.h>
 
+#include <chrono>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include <SDL.h>
@@ -107,12 +111,15 @@ static bool rawVulkanCheck() {
         report("RAW VULKAN: SDL_Vulkan_GetVkGetInstanceProcAddr returned null.");
         return false;
     }
+    // Only vkCreateInstance is a true global function: the spec guarantees
+    // it resolves with a NULL instance. vkEnumeratePhysicalDevices and
+    // vkDestroyInstance are instance-level functions — strict loaders
+    // (Adreno's included) return NULL for them with a NULL instance, which
+    // is what made this pre-check fail on a healthy device. Resolve them
+    // with the instance handle once it exists (below).
     auto vkCreateInstance = reinterpret_cast<PFN_vkCreateInstance>(getProc(nullptr, "vkCreateInstance"));
-    auto vkEnumeratePhysicalDevices =
-        reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(getProc(nullptr, "vkEnumeratePhysicalDevices"));
-    auto vkDestroyInstance = reinterpret_cast<PFN_vkDestroyInstance>(getProc(nullptr, "vkDestroyInstance"));
-    if (vkCreateInstance == nullptr || vkEnumeratePhysicalDevices == nullptr || vkDestroyInstance == nullptr) {
-        report("RAW VULKAN: could not resolve core instance functions.");
+    if (vkCreateInstance == nullptr) {
+        report("RAW VULKAN: could not resolve vkCreateInstance.");
         return false;
     }
 
@@ -141,6 +148,18 @@ static bool rawVulkanCheck() {
     }
     report("RAW VULKAN: instance created (requested API %s).",
            appInfo.apiVersion == VK_API_VERSION_1_1 ? "1.1" : "1.0");
+
+    // Instance-level functions resolve with the instance handle, not NULL.
+    auto vkEnumeratePhysicalDevices =
+        reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(getProc(instance, "vkEnumeratePhysicalDevices"));
+    auto vkDestroyInstance = reinterpret_cast<PFN_vkDestroyInstance>(getProc(instance, "vkDestroyInstance"));
+    if (vkEnumeratePhysicalDevices == nullptr || vkDestroyInstance == nullptr) {
+        report("RAW VULKAN: could not resolve core instance functions.");
+        // vkDestroyInstance may itself be the missing one, so there is
+        // nothing safe to destroy with — the instance is leaked here
+        // deliberately rather than calling through a null pointer.
+        return false;
+    }
 
     auto vkGetPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
         getProc(instance, "vkGetPhysicalDeviceProperties"));
@@ -289,6 +308,40 @@ static const char *setupResultStr(RT64::Application::SetupResult result) {
     }
 }
 
+// Bounded wait for a present id. The present queue drains asynchronously,
+// and its worker can block forever on a failed first submit: plume waits
+// on the submit fence with UINT64_MAX and swallows a failed vkQueueSubmit
+// (plume_vulkan.cpp:3629-3644), so an unbounded waitForPresentId() turns
+// a GPU failure into a silent freeze with no RESULT line — exactly what
+// run 0.1.0 did on the Adreno 710. Poll the queue's presentId with a
+// deadline instead and report the last values, so a timeout names the
+// stuck side instead of hanging.
+static bool waitForPresentDeadline(RT64::PresentQueue *queue, uint64_t waitId, int timeoutMs) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (true) {
+        uint64_t current = 0;
+        {
+            std::lock_guard<std::mutex> lock(queue->presentIdMutex);
+            current = queue->presentId;
+        }
+        if (waitId <= current) {
+            return true;
+        }
+        if (!queue->presentThreadRunning.load()) {
+            report("RT64: present wait FAILED - present thread stopped (want presentId %llu, queue at %llu).",
+                   static_cast<unsigned long long>(waitId), static_cast<unsigned long long>(current));
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            report("RT64: present wait TIMEOUT after %d ms (want presentId %llu, queue at %llu).",
+                   timeoutMs, static_cast<unsigned long long>(waitId),
+                   static_cast<unsigned long long>(current));
+            return false;
+        }
+        SDL_Delay(500);
+    }
+}
+
 static bool waitForExit() {
     SDL_Event event;
     while (true) {
@@ -305,7 +358,7 @@ extern "C" int SDL_main(int argc, char *argv[]) {
     (void)argc;
     (void)argv;
     report("========================================");
-    report("RR64 RT64 PROBE 0.1.0");
+    report("RR64 RT64 PROBE 0.1.1");
     report("NO ROM needed. NO game code.");
     report("========================================");
 
@@ -418,14 +471,51 @@ extern "C" int SDL_main(int argc, char *argv[]) {
     report("RT64: presentWait: %s, sampleLocations: %s, raytracing: %s.", boolStr(caps.presentWait),
            boolStr(caps.sampleLocations), boolStr(caps.raytracing));
     report("RT64: swapchain: %ux%u.", app->swapChain->getWidth(), app->swapChain->getHeight());
+    report("RT64: NOTE: 0x0 here is expected — the swapchain is created lazily on first present.");
+
+    // Pump SDL events until the drawable size is stable and non-zero, so
+    // the present thread's first resize() sees a live surface (the real
+    // app's window has been alive and event-pumped long before its first
+    // present; this probe's window is brand new).
+    int drawW = 0;
+    int drawH = 0;
+    for (int i = 0; i < 20; i++) {
+        SDL_PumpEvents();
+        SDL_GetWindowSizeInPixels(window, &drawW, &drawH);
+        if (drawW > 0 && drawH > 0) {
+            break;
+        }
+        SDL_Delay(100);
+    }
+    report("RT64: drawable size before frame 1: %dx%d.", drawW, drawH);
 
     // Frame 1: submit the stub VI framebuffer and wait until the present
-    // actually completes. If this hangs, the present never completed:
-    // report a freeze at "frame 1 submitted".
+    // actually completes. updateScreen() itself is timed: on frame 1 it
+    // only memcpys the stub framebuffer and advances the present queue
+    // (no display lists run, so no GPU work happens here) — if it ever
+    // takes seconds, the phone binary differs from this source. The
+    // present itself is waited on with a deadline, never unbounded:
+    // a stuck present thread must report TIMEOUT, not freeze silently.
     report("RT64: presenting frame 1 (stub VI framebuffer) ...");
+    const auto updateStart = std::chrono::steady_clock::now();
     app->updateScreen();
-    report("RT64: frame 1 submitted; waiting for present to complete ...");
-    app->presentQueue->waitForPresentId(app->state->presentId);
+    const long long updateMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - updateStart)
+            .count();
+    report("RT64: updateScreen() returned in %lld ms (state presentId=%llu workloadId=%llu swapchain=%ux%u).",
+           updateMs, static_cast<unsigned long long>(app->state->presentId),
+           static_cast<unsigned long long>(app->state->workloadId), app->swapChain->getWidth(),
+           app->swapChain->getHeight());
+    report("RT64: frame 1 submitted; waiting for present to complete (10 s deadline) ...");
+    if (!waitForPresentDeadline(app->presentQueue.get(), app->state->presentId, 10000)) {
+        report("RESULT: FAIL - frame 1 never presented (present thread stuck; see TIMEOUT line above).");
+        // Do NOT tear RT64 down here: the present thread is stuck in a
+        // fence wait and Application::end() joins it, which would hang.
+        // Leave everything running and wait for the user to close the
+        // app; the RESULT line above is already on screen and in logcat.
+        waitForExit();
+        return 1;
+    }
     report("RT64: FRAME 1 PRESENTED.");
 
     // Swapchain recreate: resize the window and present again. RT64's
@@ -440,7 +530,13 @@ extern "C" int SDL_main(int argc, char *argv[]) {
     SDL_Delay(200);
     report("RT64: window resized to 960x540; presenting frame 2 ...");
     app->updateScreen();
-    app->presentQueue->waitForPresentId(app->state->presentId);
+    if (!waitForPresentDeadline(app->presentQueue.get(), app->state->presentId, 10000)) {
+        report("RESULT: FAIL - frame 2 never presented (present thread stuck; see TIMEOUT line above).");
+        // Same as frame 1: no RT64 teardown — end() joins the stuck
+        // present thread and would hang. Show the verdict, wait for exit.
+        waitForExit();
+        return 1;
+    }
     report("RT64: FRAME 2 PRESENTED.");
     report("RT64: swapchain was %ux%u, now %ux%u.", swapWBefore, swapHBefore, app->swapChain->getWidth(),
            app->swapChain->getHeight());
