@@ -1,0 +1,175 @@
+# Build the Road Rash 64 Android game APK on GitHub Actions.
+#
+# Why CI instead of a local build: the full native build (RT64 + plume +
+# SDL + the recompiled game, ~125 generated C files) takes ~20 minutes cold
+# on a laptop and fails halfway with no saved log. CI runs it on a Linux
+# runner with ccache + Gradle + dependency caches, saves the full log, and
+# uploads the APK as an artifact. See docs/ANDROID_CI.md.
+#
+# The ROM is required at build time and must NEVER be committed to this
+# public repo. It is fetched from a private repo using the ROM_REPO and
+# ROM_REPO_TOKEN repository secrets (see docs/ANDROID_CI.md). The workflow
+# fails fast in the first minute if those secrets are missing, instead of
+# burning 20 minutes first. The token is never printed; GitHub masks
+# secrets in logs automatically.
+#
+# NOT compile-checked here: the first green build is proven only by a real
+# Actions run, not by this file existing.
+
+name: Android (full game)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A new push supersedes the run before it — no point finishing a build for
+# a commit nobody cares about anymore.
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Android game APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 5G
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      # Fail fast (first minute) if the ROM secrets are not configured.
+      # The build cannot run without the ROM, and there is no point
+      # installing the SDK/NDK first.
+      - name: Check ROM secrets are configured
+        env:
+          ROM_REPO: ${{ secrets.ROM_REPO }}
+          ROM_REPO_TOKEN: ${{ secrets.ROM_REPO_TOKEN }}
+        run: |
+          if [ -z "$ROM_REPO" ] || [ -z "$ROM_REPO_TOKEN" ]; then
+            echo "::error::ROM_REPO / ROM_REPO_TOKEN secrets are not set on this repo."
+            echo "The Android build needs your Road Rash 64 (USA).z64 at build time."
+            echo "Set them up as described in docs/ANDROID_CI.md, then re-run this workflow."
+            exit 1
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Ninja and ccache
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache
+          cmake --version
+          ninja --version
+          ccache --version
+
+      - name: Install Android SDK + NDK 28.2.13676358
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null
+          "$SDKMANAGER" --install "ndk;28.2.13676358" "platforms;android-35" "build-tools;35.0.0"
+          ls "$ANDROID_HOME/ndk/28.2.13676358/build/cmake/android.toolchain.cmake"
+
+      # ccache: the native NDK compile is the long pole. The workflow key
+      # changes when this file changes; older entries are reused as a base.
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('.github/workflows/android.yml') }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
+      # Pinned upstream dependencies (tools/, native/lib/) — fetched by
+      # scripts/setup_dependencies.py from dependencies.lock.json. Exact
+      # key only: a stale partial restore would make the script raise
+      # "Wrong dependency revision", so no restore-keys here.
+      - name: Restore pinned dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            tools
+            native/lib
+          key: rr64-deps-${{ hashFiles('dependencies.lock.json') }}
+
+      # Android-only dependencies (SDL / FreeType / AdrenoTools) — fetched
+      # by scripts/build_android.py into build-android/deps.
+      - name: Restore Android dependencies
+        uses: actions/cache@v4
+        with:
+          path: build-android/deps
+          key: rr64-android-deps-${{ hashFiles('scripts/build_android.py') }}
+
+      - name: Restore Gradle caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      # The ROM lives in a private repo (never in this public repo).
+      # actions/checkout handles the token; it is never in a shell command.
+      - name: Fetch the ROM (private repo)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.ROM_REPO }}
+          token: ${{ secrets.ROM_REPO_TOKEN }}
+          path: rom-private
+          persist-credentials: false
+
+      - name: Locate the ROM
+        run: |
+          shopt -s nullglob
+          roms=(rom-private/*.z64)
+          if [ "${#roms[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one .z64 at the root of the ROM repo (found ${#roms[@]}). See docs/ANDROID_CI.md."
+            exit 1
+          fi
+          echo "ROM_FILE=${roms[0]}" >> "$GITHUB_ENV"
+          echo "ROM file: ${roms[0]}"
+
+      - name: Build the Android APK
+        run: |
+          set -o pipefail
+          python3 scripts/build_android.py --rom "$ROM_FILE" --jobs "$(nproc)" 2>&1 | tee build.log
+
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats || true
+
+      - name: Upload the APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: roadrash64-recompiled-android-arm64-debug
+          path: dist/roadrash64-recompiled-android-arm64-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload the build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: warn
