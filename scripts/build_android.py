@@ -196,12 +196,21 @@ def main():
     # RR64_BUILD_TESTS=OFF keeps the offline test targets out of the
     # Android build; RR64_EXPERIMENTAL_COURSE=OFF drops the optional
     # user-ROM course packs (they need the external importer tool).
+    # ccache (CI): honour the standard CMAKE_*_COMPILER_LAUNCHER env vars so
+    # a cached CI run only recompiles what changed. Local builds are
+    # unaffected unless the vars are set.
+    ccache_flags = []
+    for _var in ("CMAKE_C_COMPILER_LAUNCHER", "CMAKE_CXX_COMPILER_LAUNCHER"):
+        _launcher = os.environ.get(_var)
+        if _launcher:
+            ccache_flags.append(f"-D{_var}={_launcher}")
     run(args.cmake, "-S", ROOT / "native", "-B", WORK / "native", "-G", "Ninja",
         f"-DCMAKE_TOOLCHAIN_FILE={ndk.as_posix()}/build/cmake/android.toolchain.cmake",
         "-DANDROID_ABI=arm64-v8a", "-DANDROID_PLATFORM=android-28", "-DANDROID_STL=c++_shared",
         "-DCMAKE_BUILD_TYPE=Release",
         f"-DRR64_HOST_TOOLS={WORK.as_posix()}/host/bin",
-        "-DRR64_BUILD_TESTS=OFF", "-DRR64_EXPERIMENTAL_COURSE=OFF")
+        "-DRR64_BUILD_TESTS=OFF", "-DRR64_EXPERIMENTAL_COURSE=OFF",
+        *ccache_flags)
     run(args.cmake, "--build", WORK / "native", "--target", "RoadRash64Recompiled", "-j", args.jobs)
     apk = package(ndk, sdk, "release" if args.release else "debug")
     if args.install:
