@@ -62,12 +62,57 @@ python scripts\build_android.py --rom "C:\YourDumps\Road Rash 64 (USA).z64" --jo
 :: release APK (requires the four ANDROID_KEYSTORE_* env vars; debug otherwise)
 python scripts\build_android.py --rom "C:\YourDumps\Road Rash 64 (USA).z64" --release --install
 
-:: rebuild native only after the first run (deps/host tools/ROM staging cached)
+:: fast re-run after the first full build (deps / host tools / codegen skipped)
+python scripts\build_android.py --rom "C:\YourDumps\Road Rash 64 (USA).z64" --fast --jobs 8
+
+:: package an existing native build without rebuilding
 python scripts\build_android.py --rom "C:\YourDumps\Road Rash 64 (USA).z64" --package-only
 ```
 
 Output: `dist\roadrash64-recompiled-android-arm64-debug.apk`
 (or `-release` without `-debug`).
+
+## Incremental rebuilds
+
+The full build takes ~20 minutes, mostly the NDK compile of RT64 + the
+game. A re-run does not need to redo it all — after the first successful
+build, re-run with `--fast` (see the example above). `--fast` is
+shorthand for `--skip-deps --skip-host-tools --skip-codegen`:
+
+- `--skip-deps` — skip fetching the pinned dependencies and the Android
+  patches. Only safe when they are already present at the pinned
+  revisions (i.e. after a full build); after a clean checkout, run a
+  full build first.
+- `--skip-host-tools` — skip rebuilding N64Recomp / RSPRecomp /
+  `file_to_c` when the three binaries already exist in
+  `build-android\host\bin`. Errors out if any is missing.
+- `--skip-codegen` — skip the N64Recomp / RSPRecomp runs when the
+  generated code is up to date. Up-to-date is decided by a hash stamp
+  (`build\.codegen-stamp`, gitignored) over the staged ROM, the two
+  `.toml` configs and the translator binaries — not by timestamps, so a
+  fresh checkout cannot fool it. If any input changed, codegen runs
+  again automatically.
+
+Two more stage flags, for iterating on a failure without redoing the
+rest:
+
+- `--native-only` — stop after the NDK build; skip packaging. Use it
+  while iterating on a compile error.
+- `--package-only` — package an existing native build without
+  rebuilding (already existed). Use it to retry a packaging failure.
+  `--package-only` and `--native-only` cannot be combined.
+- `--gradle-daemon` — use the Gradle daemon instead of `--no-daemon`
+  for `:app:assemble`. Default stays `--no-daemon` so CI behaviour is
+  unchanged.
+
+Do NOT use `--fast` after changing the ROM, the `.toml` configs, or the
+translators — or after deleting `build/` / `build-android/` or a clean
+checkout. Run a full build then; `--fast` trusts the previous build's
+state.
+
+Every run prints a per-stage timing summary at the end (deps / host
+tools / codegen / native / package, in seconds), so a slow re-run can be
+attributed to a stage instead of guessed at.
 
 What the script runs underneath (for diagnosis when it breaks):
 
