@@ -1,0 +1,149 @@
+# Build the Road Rash 64 Android game APK on GitLab CI.
+#
+# Why GitLab instead of GitHub Actions: the GitHub Actions workflow
+# (.github/workflows/android.yml) is still on main, but GitHub has locked
+# Ray's account out of running Actions ("The job was not started because
+# your account is locked due to a billing issue"), and that cannot be fixed
+# right now. This pipeline is a translation of that workflow to GitLab CI —
+# same build, same requirements, different runner. See
+# docs/ANDROID_GITLAB_CI.md for setup.
+#
+# The ROM is required at build time and must NEVER be committed to this
+# public repo. It is fetched from a private GitLab project using the
+# ROM_REPO and ROM_REPO_TOKEN CI variables (see docs/ANDROID_GITLAB_CI.md).
+# The pipeline fails fast in the first minute if those variables are
+# missing, instead of burning ~20 minutes first. The token is a masked
+# variable, so GitLab hides it in job logs.
+#
+# NOT compile-checked here: the first green build is proven only by a real
+# pipeline run, not by this file existing.
+
+# Only build on pushes to main and on merge requests. Every other branch
+# push would burn the 400 free compute minutes/month for nothing. The
+# $CI_OPEN_MERGE_REQUESTS guard stops a push to a branch with an open MR
+# from running both a branch pipeline and an MR pipeline for the same code.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_OPEN_MERGE_REQUESTS == null
+
+stages:
+  - build
+
+variables:
+  # Android SDK lives in the workspace (installed fresh each run; the NDK
+  # is ~1 GB, so caching it would blow the cache budget).
+  ANDROID_HOME: $CI_PROJECT_DIR/android-sdk
+  ANDROID_SDK_ROOT: $CI_PROJECT_DIR/android-sdk
+  # ccache + Gradle live in the workspace so GitLab cache can persist them.
+  CCACHE_DIR: $CI_PROJECT_DIR/.ccache
+  CCACHE_MAXSIZE: 2G
+  CMAKE_C_COMPILER_LAUNCHER: ccache
+  CMAKE_CXX_COMPILER_LAUNCHER: ccache
+  GRADLE_USER_HOME: $CI_PROJECT_DIR/.gradle
+  # Command-line tools build number, from
+  # https://developer.android.com/studio#command-line-tools-only
+  # (Linux row). If Google rotates it, update this number.
+  CMDLINE_TOOLS_BUILD: "15859902"
+
+# ccache: the native NDK compile is the long pole. Fixed key, shared
+# across branches — ccache is content-addressed, so sharing is safe.
+# Pinned upstream dependencies (tools/, native/lib/) — fetched by
+# scripts/setup_dependencies.py from dependencies.lock.json. Exact key
+# only: a stale partial restore would make the script raise
+# "Wrong dependency revision".
+# Android-only dependencies (SDL / FreeType / AdrenoTools) — fetched by
+# scripts/build_android.py into build-android/deps.
+# Gradle caches, keyed on the wrapper version.
+cache:
+  - key: ccache-v1
+    paths:
+      - .ccache/
+    policy: pull-push
+  - key:
+      files:
+        - dependencies.lock.json
+      prefix: rr64-deps
+    paths:
+      - tools/
+      - native/lib/
+    policy: pull-push
+  - key:
+      files:
+        - scripts/build_android.py
+      prefix: rr64-android-deps
+    paths:
+      - build-android/deps/
+    policy: pull-push
+  - key:
+      files:
+        - android/gradle/wrapper/gradle-wrapper.properties
+      prefix: gradle
+    paths:
+      - .gradle/
+    policy: pull-push
+
+android-build:
+  stage: build
+  image: eclipse-temurin:17-jdk-jammy
+  # Medium SaaS runner: cost factor 2x on the 400 free compute minutes /
+  # month. Small (1x) has too few cores for a parallel NDK build — the
+  # wall time roughly doubles, so it burns about the same minutes for a
+  # much slower result and risks the 1h timeout on a cold build. Large
+  # (3x) buys little. See docs/ANDROID_GITLAB_CI.md for the budget math.
+  tags:
+    - saas-linux-medium-amd64
+  interruptible: true
+  timeout: 1h
+  script:
+    # Fail fast (first minute) if the ROM variables are not configured.
+    # The build cannot run without the ROM, and there is no point
+    # installing the SDK/NDK first.
+    - |
+      if [ -z "$ROM_REPO" ] || [ -z "$ROM_REPO_TOKEN" ]; then
+        echo "ROM_REPO / ROM_REPO_TOKEN CI variables are not set on this project."
+        echo "The Android build needs your Road Rash 64 (USA).z64 at build time."
+        echo "Set them up as described in docs/ANDROID_GITLAB_CI.md, then re-run this pipeline."
+        exit 1
+      fi
+    # Toolchain: gcc/g++ for the host tools, CMake + Ninja for the
+    # NDK build, ccache, git, Python, unzip/curl for the SDK download.
+    - apt-get update -qq
+    - DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential cmake ninja-build ccache git python3 unzip curl ca-certificates
+    - cmake --version
+    - ninja --version
+    - ccache --version
+    # Android SDK + NDK 28.2.13676358 (exact — scripts/build_android.py
+    # requires this version and checks for its toolchain file).
+    - |
+      mkdir -p "$ANDROID_HOME/cmdline-tools"
+      curl -fsSL -o /tmp/cmdline-tools.zip "https://dl.google.com/android/repository/commandlinetools-linux-${CMDLINE_TOOLS_BUILD}_latest.zip"
+      unzip -q /tmp/cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools"
+      mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+      rm /tmp/cmdline-tools.zip
+      SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+      yes | "$SDKMANAGER" --licenses >/dev/null
+      "$SDKMANAGER" --install "ndk;28.2.13676358" "platforms;android-35" "build-tools;35.0.0"
+      ls "$ANDROID_HOME/ndk/28.2.13676358/build/cmake/android.toolchain.cmake"
+    # The ROM lives in a private GitLab project (never in this public
+    # repo). The token is a masked CI variable, so GitLab hides it in
+    # the job log if it ever appears there.
+    - git clone --depth 1 "https://oauth2:${ROM_REPO_TOKEN}@gitlab.com/${ROM_REPO}.git" rom-private
+    - |
+      n=$(find rom-private -maxdepth 1 -name '*.z64' | wc -l)
+      if [ "$n" -ne 1 ]; then
+        echo "Expected exactly one .z64 at the root of the ROM project (found $n). See docs/ANDROID_GITLAB_CI.md."
+        exit 1
+      fi
+      ROM_FILE=$(find rom-private -maxdepth 1 -name '*.z64')
+      echo "ROM file: $ROM_FILE"
+    - set -o pipefail
+    - python3 scripts/build_android.py --rom "$ROM_FILE" --jobs "$(nproc)" 2>&1 | tee build.log
+  after_script:
+    - ccache --show-stats || true
+  artifacts:
+    when: always
+    paths:
+      - build.log
+      - dist/roadrash64-recompiled-android-arm64-debug.apk
+    expire_in: 30 days
