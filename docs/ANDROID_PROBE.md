@@ -7,6 +7,63 @@
 > Windows machine. If a step fails there, the failure itself is the next
 > piece of information — send the failing command + its output back.
 
+## 0.1.1 — what changed after run 0.1.0 froze (2026-11-08)
+
+**Run 0.1.0 (Motorola Edge 50 Fusion, Adreno 710):** RT64 `setup()` returned
+`Success`, descriptor indexing YES, scalar block layout YES — then the probe
+froze inside the first present and never printed a `RESULT:` line (logcat,
+30+ s of silence after `presenting frame 1 ...`). The raw pre-check also
+failed on that run with `could not resolve core instance functions`.
+
+**Diagnosis (traced against pinned RT64 `6f1c2d99` / plume `d890ac89`):**
+- The freeze was **not** in `app->updateScreen()` — on frame 1 that only
+  memcpys the stub framebuffer and advances the present queue (no display
+  lists run, so no GPU work happens there). It was in the **present
+  thread**: plume waits on the first submit's fence with `UINT64_MAX`
+  and swallows a failed `vkQueueSubmit` (`plume_vulkan.cpp:3629-3644`), so
+  any first-submit failure becomes an infinite hang; the probe then blocked
+  forever in the unbounded `waitForPresentId()`. The `swapchain: 0x0`
+  reading was expected (the swapchain is created lazily on first present),
+  not the cause.
+- The pre-check failure was a **probe bug**: it resolved
+  `vkEnumeratePhysicalDevices` + `vkDestroyInstance` with a NULL instance,
+  but those are instance-level functions — strict loaders return NULL for
+  them. Only `vkCreateInstance` is guaranteed to resolve with NULL.
+
+**What 0.1.1 changes (`android/probe/`, versionCode 2):**
+1. Pre-check resolves only `vkCreateInstance` with NULL, then resolves the
+   other two with the instance handle after creating it.
+2. Before frame 1, the probe pumps SDL events until the drawable size is
+   stable/non-zero, so the present thread's first `resize()` sees a live
+   surface.
+3. `updateScreen()` is timed and logged (`updateScreen() returned in X ms`
+   + presentId/workloadId/swapchain) — on frame 1 it should return in
+   under a millisecond; seconds would mean the phone binary differs from
+   this source.
+4. The unbounded `waitForPresentId()` is replaced by a bounded poll
+   (10 s deadline, logged every 500 ms): a stuck present thread now
+   reports `RESULT: FAIL - frame N never presented` with the last
+   presentId values instead of freezing silently. Pass still requires
+   setup + both frames presented.
+5. **Not fixed here (follow-up, in the fork's plume/RT64):** bounding
+   plume's own unbounded waits (`vkAcquireNextImageKHR` and
+   `vkWaitForFences` with `UINT64_MAX`, `plume_vulkan.cpp:2489,3638`) and
+   propagating a failed `vkQueueSubmit` instead of swallowing it. A failed
+   first submit must surface as an error, not an infinite hang.
+
+**Retest (0.1.1):** rebuild from this branch (`python
+scripts/build_probe.py`, same as before — the APK is now
+`rr64-rt64-probe-debug.apk`, version 0.1.1). Run on the **Moto first**
+(same phone that froze, so the fix is tested against the known failure),
+then the **G81** (the actual Mali gate). Send the screenshot as before. If
+it now reports `FAIL - frame N never presented`, also capture **unfiltered**
+logcat (`adb logcat -d > probe-fail.log`, no `-s` filter): plume/RT64
+`fprintf(stderr)` lines (e.g. `vkQueueSubmit failed`) never reach the
+`RR64Probe` tag, and a native driver crash would appear under
+`DEBUG`/`AndroidRuntime`. If it still freezes with no `RESULT:` line at
+all, say so explicitly — that would mean the hang is somewhere the new
+logging does not cover.
+
 ## 0. The one-line design correction
 
 **Recompilation (N64Recomp MIPS → C → native ARM64) happens at BUILD time
@@ -158,9 +215,10 @@ here) are listed in `android/probe/README.md` under "Known quirks / risks".
   adb logcat -s RR64Probe > probe-fail.log
   ```
   (Run that command first, then open the probe; Ctrl+C after it fails.)
-  If the probe **freezes** (no `RESULT:` line, screen stuck on
-  "frame 1 submitted"), say so explicitly — a frozen present is itself
-  the failure, and the logcat up to the freeze is what matters.
+  If the probe reports a TIMEOUT/FAIL instead of freezing, the logcat up
+  to the failure is what matters — and capture it **unfiltered** too
+  (`adb logcat -d > probe-fail-full.log`): plume/RT64 `fprintf(stderr)`
+  lines never reach the `RR64Probe` tag.
 - Also say which phone it was (G81 or Poco) — the two devices answer
   different questions.
 
