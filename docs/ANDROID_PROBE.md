@@ -7,6 +7,85 @@
 > Windows machine. If a step fails there, the failure itself is the next
 > piece of information — send the failing command + its output back.
 
+## 0.1.2 — watchdog around updateScreen() itself (2026-11-08)
+
+**Run 0.1.1 (Motorola Edge 50 Fusion, Adreno 710):** right build this
+time (banner 0.1.1, raw pre-check fully passes, drawable size
+1080x2400, `setup()` Success) — but the screen still ends at
+`presenting frame 1 ...` with no `updateScreen() returned in X ms`
+line and no `RESULT:`, and the follow-up logcat shows no timing line
+24 s after `presenting frame 1 ...`. So 0.1.1's bounded present wait
+never runs: it sits *after* `updateScreen()`, and if `updateScreen()`
+itself never returns, no line after it can ever print — including the
+timing line that was supposed to distinguish the two hangs.
+
+**Re-diagnosis (traced against pinned RT64 `6f1c2d99` / plume
+`d890ac89`, with the patches applied):** the PR #2 "updateScreen()
+returns immediately" reading holds for the **main-thread** path — the
+only wait in `State::updateScreen()` on frame 1 is
+`PresentQueue::advanceToNextPresent()`'s barrier wait
+(`rt64_present_queue.cpp:91-93`), which returns immediately on frame 1
+(writeCursor 0 → 1, barrierCursor 0, ring size 4), and every other
+call is pure computation or a trivial accessor (`paused` is false,
+the framebuffer upload path is unreachable with an empty manager,
+`advancePresent` is bookkeeping, `getWidth()` is a plain member read).
+The **present thread** does have unbounded blocks on frame 1 — the
+resize-path fence wait and the submit fence wait (both via plume
+`waitForCommandFence` → `vkWaitForFences(..., UINT64_MAX)` after a
+swallowed `vkQueueSubmit` failure, `plume_vulkan.cpp:3629-3644`), plus
+`vkAcquireNextImageKHR` with `UINT64_MAX` (`plume_vulkan.cpp:2489`) —
+but no mutex or condition in `updateScreen()`'s path is held by the
+present thread, so a stuck present thread alone cannot block
+`updateScreen()` in this source. That leaves two explanations for the
+missing timing line: the phone binary's RT64 differs from the pinned
+source, or the logcat dump was taken before the line could appear.
+0.1.2 settles it in one run either way: if the timing line prints,
+`updateScreen()` returned and the hang is the present wait (the PR #2
+diagnosis stands); if the watchdog fires, `updateScreen()` really does
+not return in the phone binary.
+
+**What 0.1.2 changes (`android/probe/`, versionCode 3):**
+1. `updateScreen()` runs on a worker thread with a 10 s watchdog
+   (`updateScreenWithWatchdog()`, frames 1 and 2): on success it prints
+   the timing line as before; on timeout it prints a `WATCHDOG TIMEOUT`
+   line with the present thread's state (presentId, running, swapchain)
+   and `RESULT: FAIL - updateScreen() hung on frame N`. The worker is
+   detached on timeout, never joined — and there is no RT64 teardown on
+   that path, for the same reason as the present-timeout path
+   (`Application::end()` joins the stuck threads and would hang).
+2. Nothing else changes: the 0.1.1 bounded present wait still covers
+   the present wait once `updateScreen()` returns, and the pass
+   criterion is unchanged (setup + both frames presented).
+3. **Still not fixed here (follow-up, in the fork's plume/RT64):**
+   bounding plume's own unbounded waits (`vkAcquireNextImageKHR` and
+   `vkWaitForFences` with `UINT64_MAX`, `plume_vulkan.cpp:2489,3638`)
+   and propagating a failed `vkQueueSubmit` instead of swallowing it.
+   A failed first submit must surface as an error, not an infinite hang.
+
+**Retest (0.1.2):** rebuild from this branch (`python
+scripts/build_probe.py`, no `--skip-deps`, so the RT64 tree is
+re-verified at the pinned commit — this also rules out a stale RT64
+library in the previous build; the APK is now version 0.1.2). Run on
+the **Moto first** (same phone that froze), then the **G81**. Send the
+screenshot as before, plus **unfiltered** logcat (`adb logcat -d >
+probe-fail.log`, no `-s` filter) either way this time — the watchdog
+verdict and the timing line are both in it, and the unfiltered log
+also carries any plume/RT64 `fprintf(stderr)` lines (validation errors,
+driver messages) that the `RR64Probe` tag misses. What each outcome
+means:
+- Timing line prints, then `RESULT: PASS` → the probe passes; the
+  earlier missing line was a dump-timing artefact, and the PR #2
+  present-thread diagnosis stands.
+- Timing line prints, then `RESULT: FAIL - frame N never presented` →
+  `updateScreen()` returns; the hang is the present wait (first
+  resize/submit). The unfiltered logcat's stderr lines name the GPU
+  failure.
+- `WATCHDOG TIMEOUT` + `RESULT: FAIL - updateScreen() hung` →
+  `updateScreen()` really does not return in the phone binary. Send
+  the unfiltered logcat and confirm the exact branch/commit the APK
+  was built from — the next step is then the plume/RT64 wait bounding
+  in the follow-up above.
+
 ## 0.1.1 — what changed after run 0.1.0 froze (2026-11-08)
 
 **Run 0.1.0 (Motorola Edge 50 Fusion, Adreno 710):** RT64 `setup()` returned

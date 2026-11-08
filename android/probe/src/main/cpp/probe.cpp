@@ -9,10 +9,13 @@
 //   -> RT64::Application(core, appConfig{ useConfigurationFile=false,
 //                                         detectDataPath=false })
 //   -> app->setup(thread_id 0)
-//   -> app->updateScreen()  (submits one present of the stub VI framebuffer)
+//   -> app->updateScreen() on a worker thread with a 10 s watchdog
+//      (submits one present of the stub VI framebuffer; 0.1.1 showed the
+//      timing line never printing, so updateScreen() itself must be
+//      bounded too — see 0.1.2 notes in docs/ANDROID_PROBE.md)
 //   -> bounded poll of presentQueue->presentId (10 s deadline, never an
 //      unbounded waitForPresentId: a stuck present thread must report
-//      TIMEOUT, not freeze silently — see 0.1.1 notes in docs/ANDROID_PROBE.md)
+//      TIMEOUT, not freeze silently)
 //   -> resize the SDL window, updateScreen() again (exercises the
 //      swapchain-recreate path RT64's present queue owns)
 //
@@ -34,6 +37,7 @@
 // android/probe/README.md.
 #include <android/log.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdint>
@@ -42,6 +46,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include <SDL.h>
 #include <SDL_system.h>
@@ -342,6 +347,75 @@ static bool waitForPresentDeadline(RT64::PresentQueue *queue, uint64_t waitId, i
     }
 }
 
+// Run updateScreen() on a worker thread with a deadline, so a stuck
+// updateScreen() reports instead of freezing the probe silently.
+// Why this exists (0.1.2): run 0.1.1's logcat shows no
+// "updateScreen() returned in X ms" line 24 s after "presenting frame
+// 1", so the 0.1.1 assumption — updateScreen() always returns and only
+// the present wait can hang — is not safe to rely on. Traced against
+// pinned RT64 6f1c2d99 / plume d890ac89, the main-thread path of
+// updateScreen() on frame 1 has no blocking call of its own: the only
+// wait in it is PresentQueue::advanceToNextPresent()'s barrier wait
+// (rt64_present_queue.cpp:91-93), which returns immediately on frame 1
+// (writeCursor 0 -> 1, barrierCursor 0, ring size 4), and every other
+// call is pure computation or a trivial accessor. The present thread
+// does have unbounded blocks on frame 1 — the resize-path fence wait
+// (rt64_present_queue.cpp, threadLoop) and the submit fence wait
+// (threadPresent), both via plume waitForCommandFence ->
+// vkWaitForFences(..., UINT64_MAX) after a swallowed vkQueueSubmit
+// failure (plume_vulkan.cpp:3629-3644), plus vkAcquireNextImageKHR
+// with UINT64_MAX (plume_vulkan.cpp:2489) — but no mutex or condition
+// in updateScreen()'s path is held by the present thread, so a stuck
+// present thread alone cannot block updateScreen() in this source.
+// That leaves two explanations for the missing timing line: the phone
+// binary's RT64 differs from the pinned source, or the logcat dump was
+// taken before the line could appear. This watchdog settles it in one
+// run either way: if the timing line prints, updateScreen() returned
+// and the hang is the present wait; if the watchdog fires, updateScreen()
+// really does not return in the phone binary. Either way the probe now
+// reports a RESULT instead of hanging.
+// On timeout the worker is detached, never joined: it may be stuck
+// inside RT64 forever, and joining it (or calling app->end(), which
+// joins the present thread) would hang. The verdict is already on
+// screen and in logcat; the app waits for the user to close it.
+static bool updateScreenWithWatchdog(RT64::Application *app, const char *frameLabel, int timeoutMs) {
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    auto updateMs = std::make_shared<std::atomic<long long>>(-1);
+    std::thread worker([app, done, updateMs]() {
+        const auto start = std::chrono::steady_clock::now();
+        app->updateScreen();
+        updateMs->store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
+                            .count());
+        done->store(true);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (!done->load()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            uint64_t presentId = 0;
+            {
+                std::lock_guard<std::mutex> lock(app->presentQueue->presentIdMutex);
+                presentId = app->presentQueue->presentId;
+            }
+            report("RT64: updateScreen() WATCHDOG TIMEOUT after %d ms on %s (updateScreen never returned).", timeoutMs,
+                   frameLabel);
+            report("RT64: present thread state at timeout: presentId=%llu running=%s swapchain=%ux%u.",
+                   static_cast<unsigned long long>(presentId),
+                   app->presentQueue->presentThreadRunning.load() ? "YES" : "NO", app->swapChain->getWidth(),
+                   app->swapChain->getHeight());
+            report("RESULT: FAIL - updateScreen() hung on %s (see WATCHDOG line above).", frameLabel);
+            worker.detach(); // Never join a thread that may be stuck inside RT64.
+            return false;
+        }
+        SDL_Delay(100);
+    }
+    worker.join();
+    report("RT64: updateScreen() returned in %lld ms (state presentId=%llu workloadId=%llu swapchain=%ux%u).",
+           updateMs->load(), static_cast<unsigned long long>(app->state->presentId),
+           static_cast<unsigned long long>(app->state->workloadId), app->swapChain->getWidth(),
+           app->swapChain->getHeight());
+    return true;
+}
+
 static bool waitForExit() {
     SDL_Event event;
     while (true) {
@@ -358,7 +432,7 @@ extern "C" int SDL_main(int argc, char *argv[]) {
     (void)argc;
     (void)argv;
     report("========================================");
-    report("RR64 RT64 PROBE 0.1.1");
+    report("RR64 RT64 PROBE 0.1.2");
     report("NO ROM needed. NO game code.");
     report("========================================");
 
@@ -490,22 +564,21 @@ extern "C" int SDL_main(int argc, char *argv[]) {
     report("RT64: drawable size before frame 1: %dx%d.", drawW, drawH);
 
     // Frame 1: submit the stub VI framebuffer and wait until the present
-    // actually completes. updateScreen() itself is timed: on frame 1 it
-    // only memcpys the stub framebuffer and advances the present queue
-    // (no display lists run, so no GPU work happens here) — if it ever
-    // takes seconds, the phone binary differs from this source. The
-    // present itself is waited on with a deadline, never unbounded:
-    // a stuck present thread must report TIMEOUT, not freeze silently.
+    // actually completes. updateScreen() runs on a worker thread with a
+    // 10 s watchdog (0.1.2): run 0.1.1's logcat showed no timing line
+    // 24 s after "presenting frame 1", so updateScreen() itself must be
+    // bounded too — the 0.1.1 bounded present wait never runs if
+    // updateScreen() never returns. The watchdog prints the timing line
+    // on success and a WATCHDOG TIMEOUT + RESULT: FAIL on timeout.
     report("RT64: presenting frame 1 (stub VI framebuffer) ...");
-    const auto updateStart = std::chrono::steady_clock::now();
-    app->updateScreen();
-    const long long updateMs =
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - updateStart)
-            .count();
-    report("RT64: updateScreen() returned in %lld ms (state presentId=%llu workloadId=%llu swapchain=%ux%u).",
-           updateMs, static_cast<unsigned long long>(app->state->presentId),
-           static_cast<unsigned long long>(app->state->workloadId), app->swapChain->getWidth(),
-           app->swapChain->getHeight());
+    if (!updateScreenWithWatchdog(app.get(), "frame 1", 10000)) {
+        // Do NOT tear RT64 down here: updateScreen() (and/or the present
+        // thread) is stuck, and Application::end() joins those threads,
+        // which would hang. The RESULT line above is already on screen
+        // and in logcat; wait for the user to close the app.
+        waitForExit();
+        return 1;
+    }
     report("RT64: frame 1 submitted; waiting for present to complete (10 s deadline) ...");
     if (!waitForPresentDeadline(app->presentQueue.get(), app->state->presentId, 10000)) {
         report("RESULT: FAIL - frame 1 never presented (present thread stuck; see TIMEOUT line above).");
@@ -529,7 +602,12 @@ extern "C" int SDL_main(int argc, char *argv[]) {
     }
     SDL_Delay(200);
     report("RT64: window resized to 960x540; presenting frame 2 ...");
-    app->updateScreen();
+    if (!updateScreenWithWatchdog(app.get(), "frame 2", 10000)) {
+        // Same as frame 1: no RT64 teardown — end() would join the stuck
+        // updateScreen/present threads and hang.
+        waitForExit();
+        return 1;
+    }
     if (!waitForPresentDeadline(app->presentQueue.get(), app->state->presentId, 10000)) {
         report("RESULT: FAIL - frame 2 never presented (present thread stuck; see TIMEOUT line above).");
         // Same as frame 1: no RT64 teardown — end() joins the stuck
