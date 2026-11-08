@@ -44,7 +44,9 @@
 #include <thread>
 #include <vector>
 
+#ifndef __ANDROID__
 #include "nfd.h"
+#endif
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
 #include "ultramodern/config.hpp"
@@ -55,6 +57,9 @@
 #define SDL_MAIN_HANDLED
 #include "SDL.h"
 #include "SDL_syswm.h"
+#ifdef __ANDROID__
+#include "android/rr64_android.h"
+#endif
 #ifdef None
 #undef None
 #endif
@@ -739,7 +744,13 @@ ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::
     SDL_SysWMinfo wm_info{};
     SDL_VERSION(&wm_info.version);
     if (!SDL_GetWindowWMInfo(window, &wm_info)) {
+#ifndef __ANDROID__
         fatal_sdl("SDL_GetWindowWMInfo failed");
+#else
+        // Android returns the SDL_Window* itself below; a failed WM query
+        // must not abort boot (never exercised by the probe).
+        rr64_log("[RR64-STAGE] SDL_GetWindowWMInfo failed; continuing with SDL_Window*.\n");
+#endif
     }
 
 #ifdef _WIN32
@@ -2764,7 +2775,28 @@ extern "C" void rr64_record_interpolation_workload(
 
 #include "rr64_sync_log.hpp"
 
+#ifdef __ANDROID__
+// Android entry point: SDLActivity calls SDL_main directly (the probe proved
+// this pattern); SDL_MAIN_HANDLED above stops SDL from renaming main().
+extern "C" int SDL_main(int argc, char** argv) {
+    // Storage/env setup first, then the shared startup below.
+    if (!rr64::android::initialize()) {
+        rr64::android::startup_error("Android storage initialization failed.");
+    }
+    // The launcher hands the staged ROM over in RR64_ANDROID_ROM_PATH; this
+    // phase stages it manually with adb. Only use it when the file exists:
+    // otherwise the stored ROM (validated on a previous run) starts instead.
+    if (const char* rom_path = std::getenv("RR64_ANDROID_ROM_PATH")) {
+        if (std::filesystem::exists(rom_path)) {
+            g_auto_rom_path = std::filesystem::path(rom_path);
+        }
+    }
+    // Android always auto-starts (the --skip-launcher path); there is no
+    // desktop launcher UI on the phone.
+    g_auto_start_pending.store(true);
+#else
 int main(int argc, char** argv) {
+#endif
     if(argc>=2 && std::strcmp(argv[1],"--replay-case")==0){
         if(argc!=4 && argc!=5)return EXIT_FAILURE;
         if(argc==5 && std::strcmp(argv[4],"--live-baseline")!=0)return EXIT_FAILURE;
@@ -2833,10 +2865,12 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
+#ifndef __ANDROID__
     if (NFD_Init() != NFD_OKAY) {
         std::fprintf(stderr, "[RR64] Native file dialog initialization failed.\n");
         return EXIT_FAILURE;
     }
+#endif
 
     rr64_log("[RR64-STAGE] Program configuration.\n");
     recompui::programconfig::set_program_name(kProgramName);
@@ -3110,7 +3144,9 @@ int main(int argc, char** argv) {
         std::fclose(g_audio_trace_file);
         g_audio_trace_file = nullptr;
     }
+#ifndef __ANDROID__
     NFD_Quit();
+#endif
 #ifdef _WIN32
     timeEndPeriod(1);
 #endif

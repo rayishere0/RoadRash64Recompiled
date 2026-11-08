@@ -1,4 +1,7 @@
-add_executable(RoadRash64Recompiled
+# The game sources, shared by the desktop executable and the Android shared
+# library (SDLActivity loads it as "main"). Keep this list identical for
+# both; only the target kind and the Android bridge file differ.
+set(RR64_GAME_SOURCES
     "${RR64_REPLAY_FRAME_SOURCE}"
     "${RR64_REPLAY_RESOURCE_SOURCE}"
     src/main.cpp
@@ -94,6 +97,15 @@ add_executable(RoadRash64Recompiled
     src/rr64_race_pack_menu.cpp
 )
 
+if(ANDROID)
+    # SDLActivity loads the game as libmain.so; the bridge (JNI lifecycle +
+    # storage setup) lives in the same library.
+    add_library(RoadRash64Recompiled SHARED ${RR64_GAME_SOURCES} src/android/rr64_android.cpp)
+    set_target_properties(RoadRash64Recompiled PROPERTIES OUTPUT_NAME main)
+else()
+    add_executable(RoadRash64Recompiled ${RR64_GAME_SOURCES})
+endif()
+
 if(RR64_EXPERIMENTAL_COURSE)
     target_sources(RoadRash64Recompiled PRIVATE
         src/rr64_experimental_course.cpp src/rr64_experimental_course_route.cpp
@@ -178,6 +190,13 @@ target_link_libraries(RoadRash64Recompiled PRIVATE
     ${RR64_SDL2_TARGET}
     opus
 )
+if(ANDROID)
+    # SDL2::SDL2 already comes in through ${RR64_SDL2_TARGET} above (the
+    # probe's pattern: SDL_main, no SDL2main). The game also needs the
+    # Android system libs (the bridge uses the Android storage APIs).
+    target_link_libraries(RoadRash64Recompiled PRIVATE android log)
+    target_compile_definitions(RoadRash64Recompiled PRIVATE PLUME_SDL_VULKAN_ENABLED RT64_SDL_WINDOW_VULKAN)
+endif()
 # nativefiledialog-extended is not built on Android (RT64's Android patch
 # skips it; file dialogs belong to the Java launcher). Link nfd everywhere
 # else.

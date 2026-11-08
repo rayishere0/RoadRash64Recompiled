@@ -1,10 +1,8 @@
-// Full-game Android app module — SCAFFOLD ONLY, NOT WIRED IN.
-// android/settings.gradle does NOT include ':app' yet: there is no native
-// target (the executable must become a shared 'main' library), no
-// LauncherActivity/GameActivity, and no JNI bridge. Those land in the full
-// port AFTER the RT64 probe (android/probe/) passes on device.
-// See android/app/README_SCAFFOLD.md. Do not add `include ':app'` until
-// the probe gate passes and the native target exists.
+// Full-game Android app module — WIRED IN (settings.gradle includes ':app').
+// The native target is the shared 'main' library (native/ -> libmain.so) and
+// GameActivity (the SDL host) exists. Still missing: the real LauncherActivity
+// (ROM picker/import), touch controls, Controller Pak saves — later steps.
+// See docs/ANDROID_GAME_BUILD.md and android/app/README_SCAFFOLD.md.
 //
 // Adapted from AeroGauge's android/app/build.gradle (AGP 8.9.2, NDK
 // 28.2.13676358, minSdk 28, targetSdk/compileSdk 35, arm64-v8a only).
