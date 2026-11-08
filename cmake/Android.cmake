@@ -1,12 +1,15 @@
 # Android native-dependency config for the FULL GAME build.
 #
 # Included by native/CMakeLists.txt with `if(ANDROID)
-# include(cmake/Android.cmake)` — that include does NOT exist yet; add it
-# when the full port lands (see android/app/README_SCAFFOLD.md). Nothing
-# executes this file until then.
+# include(cmake/Android.cmake)` — before Dependencies.cmake, which needs the
+# SDL2/DXC variables set here.
 #
 # Adapted from AeroGauge's cmake/Android.cmake (AERO_* -> RR64_*).
 # Native dependencies are fetched and pinned by scripts/build_android.py.
+#
+# build_android.py configures -S native, so CMAKE_SOURCE_DIR is native/, not
+# the repo root. Derive the root from this file's own location instead.
+get_filename_component(RR64_REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
@@ -16,13 +19,13 @@ set(SDL_TEST OFF CACHE BOOL "" FORCE)
 set(SDL_TESTS OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_DICTBUILDER OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
-set(RR64_ANDROID_DEPS "${CMAKE_SOURCE_DIR}/build-android/deps" CACHE PATH "Android dependency sources")
+set(RR64_ANDROID_DEPS "${RR64_REPO_ROOT}/build-android/deps" CACHE PATH "Android dependency sources")
 add_subdirectory("${RR64_ANDROID_DEPS}/SDL" "${CMAKE_BINARY_DIR}/SDL")
 # The variable Dependencies.cmake's Android branch consumes.
 set(RR64_ANDROID_SDL2_INCLUDE_DIRS "${RR64_ANDROID_DEPS}/SDL/include")
 set(SDL2_INCLUDE_DIRS "${RR64_ANDROID_DEPS}/SDL/include")
 set(SDL2_LIBRARIES SDL2::SDL2)
-list(PREPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake/android")
+list(PREPEND CMAKE_MODULE_PATH "${RR64_REPO_ROOT}/cmake/android")
 foreach(dep ZLIB BZIP2 PNG HARFBUZZ BROTLI)
     set(FT_DISABLE_${dep} ON CACHE BOOL "" FORCE)
 endforeach()
@@ -40,7 +43,7 @@ endif()
 add_executable(file_to_c IMPORTED GLOBAL)
 set_target_properties(file_to_c PROPERTIES IMPORTED_LOCATION
     "${RR64_HOST_TOOLS}/file_to_c${CMAKE_HOST_EXECUTABLE_SUFFIX}")
-set(RR64_DXC_ROOT "${CMAKE_SOURCE_DIR}/native/lib/rt64/src/contrib/dxc")
+set(RR64_DXC_ROOT "${RR64_REPO_ROOT}/native/lib/rt64/src/contrib/dxc")
 if(CMAKE_HOST_WIN32)
     set(RR64_HOST_DXC "${RR64_DXC_ROOT}/bin/x64/dxc.exe")
 else()
@@ -51,11 +54,17 @@ endif()
 set(PLUME_SDL_VULKAN_ENABLED ON CACHE BOOL "" FORCE)
 # 16 KiB page size: required for Android 15+.
 add_link_options("-Wl,-z,max-page-size=16384")
-add_subdirectory("${RR64_ANDROID_DEPS}/adrenotools" "${CMAKE_BINARY_DIR}/adrenotools")
-# TODO (full port): src/android/rr64_vulkan_loader.cpp does not exist yet.
-# It is the app-local vkGetInstanceProcAddr (system driver vs Turnip via
-# AdrenoTools), adapted from AeroGauge's src/android/aero_vulkan_loader.cpp.
-# Uncomment once the file lands:
-# add_library(rr64_vulkan SHARED "${CMAKE_SOURCE_DIR}/src/android/rr64_vulkan_loader.cpp")
-# target_link_libraries(rr64_vulkan PRIVATE adrenotools log dl)
-# add_dependencies(rr64_vulkan main_hook hook_impl)
+# Turnip (Adreno-only) is OFF for v1: the probe passed on the system driver
+# on Adreno and Mali, and Turnip cannot help the Mali devices that matter
+# most. If a device ever fails setup() with GraphicsDeviceNotFound, flip this
+# on and land native/src/android/rr64_vulkan_loader.cpp (adapted from
+# AeroGauge's src/android/aero_vulkan_loader.cpp) plus DriverImport.java.
+option(RR64_ANDROID_TURNIP "Build the AdrenoTools Turnip Vulkan loader (Adreno-only)" OFF)
+if(RR64_ANDROID_TURNIP)
+    add_subdirectory("${RR64_ANDROID_DEPS}/adrenotools" "${CMAKE_BINARY_DIR}/adrenotools")
+    # The loader is the app-local vkGetInstanceProcAddr (system driver vs
+    # Turnip via AdrenoTools). Uncomment once the file lands:
+    # add_library(rr64_vulkan SHARED "${RR64_REPO_ROOT}/native/src/android/rr64_vulkan_loader.cpp")
+    # target_link_libraries(rr64_vulkan PRIVATE adrenotools log dl)
+    # add_dependencies(rr64_vulkan main_hook hook_impl)
+endif()
