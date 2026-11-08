@@ -36,6 +36,7 @@
 // NOT compile-checked: no NDK / Android Studio on this machine. See
 // android/probe/README.md.
 #include <android/log.h>
+#include <jni.h>
 
 #include <atomic>
 #include <chrono>
@@ -53,6 +54,14 @@
 #include <SDL_vulkan.h>
 #include <vulkan/vulkan.h>
 
+#ifdef select
+#undef select
+#endif
+
+#ifndef HLSL_CPU
+#define HLSL_CPU
+#endif
+
 #include "hle/rt64_application.h"
 
 #define PROBE_LOG_TAG "RR64Probe"
@@ -69,8 +78,8 @@ static void report(const char *format, ...) {
     __android_log_print(ANDROID_LOG_INFO, PROBE_LOG_TAG, "%s", line);
     fprintf(stderr, "[RR64Probe] %s\n", line);
 
-    JNIEnv *env = SDL_AndroidGetJNIEnv();
-    jobject activity = (env != nullptr) ? SDL_AndroidGetActivity() : nullptr;
+    JNIEnv *env = static_cast<JNIEnv*>(SDL_AndroidGetJNIEnv());
+    jobject activity = (env != nullptr) ? static_cast<jobject>(SDL_AndroidGetActivity()) : nullptr;
     if (env == nullptr || activity == nullptr) {
         return;
     }

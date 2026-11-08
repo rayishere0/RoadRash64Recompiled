@@ -3,8 +3,8 @@
 #include <cstdlib>
 extern "C" {
 void rr64_record_pipeline_stage(unsigned, unsigned long long) { std::abort(); }
-int rr64_is_race_mode_active() { std::abort(); }
-int rr64_is_race_presentation_active() { std::abort(); }
+int rr64_is_race_mode_active() { return 0; }
+int rr64_is_race_presentation_active() { return 0; }
 void rr64_record_geometry_compatibility(unsigned long long, unsigned, unsigned) { std::abort(); }
 void rr64_record_owned_batch(unsigned long long, unsigned, unsigned, unsigned) { std::abort(); }
 void rr64_record_interpolation_workload(unsigned, unsigned, unsigned, unsigned, unsigned, unsigned) { std::abort(); }
@@ -20,4 +20,6 @@ void rr64_record_present_target_sample(unsigned long long, unsigned long long, u
     unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
     unsigned, unsigned) { std::abort(); }
 void rr64_record_present_interval(unsigned, unsigned, unsigned, unsigned, unsigned, unsigned) { std::abort(); }
+void rr64_record_authored_sample(unsigned long long, unsigned long long, unsigned long long, unsigned int, unsigned int, unsigned long long, unsigned long long) { std::abort(); }
+void rr64_record_source_cadence(unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int) { std::abort(); }
 }

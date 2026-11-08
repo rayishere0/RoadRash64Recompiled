@@ -62,13 +62,13 @@ def fetch_repo(url, destination, commit):
 def apply_patch_idempotent(directory, patch):
     """Apply a patch, skipping it if it is already applied."""
     reverse = subprocess.run(
-        ["git", "-C", str(directory), "apply", "--reverse", "--check", str(patch)],
+        ["git", "-C", str(directory), "apply", "--reverse", "--check", "--ignore-space-change", "--ignore-whitespace", str(patch)],
         capture_output=True)
     if reverse.returncode == 0:
         print(f"already applied: {patch.name} in {directory}")
         return
-    run("git", "-C", directory, "apply", "--check", patch)
-    run("git", "-C", directory, "apply", patch)
+    run("git", "-C", directory, "apply", "--check", "--ignore-space-change", "--ignore-whitespace", patch)
+    run("git", "-C", directory, "apply", "--ignore-space-change", "--ignore-whitespace", patch)
     print(f"applied: {patch.name} in {directory}")
 
 

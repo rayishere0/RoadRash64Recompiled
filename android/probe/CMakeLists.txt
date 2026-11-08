@@ -90,7 +90,10 @@ add_subdirectory("${RR64_RT64_DIR}" "${CMAKE_BINARY_DIR}/rt64")
 # NOTE: SDL2main is deliberately NOT linked: on Android, SDL's
 # SDLActivity calls SDL_main directly. If the link fails with an
 # undefined SDL_main reference, add SDL2main back here.
-add_library(main SHARED src/main/cpp/probe.cpp)
+add_library(main SHARED
+    src/main/cpp/probe.cpp
+    ../../native/tests/rr64_matching_test_callbacks.cpp
+)
 # RT64's own include dirs are directory-scoped inside its tree, so the
 # probe target needs the same list explicitly (from RT64's CMakeLists).
 target_include_directories(main PRIVATE
